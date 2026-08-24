@@ -1,0 +1,336 @@
+# Praxsuite SDK for Java - validate, build, and mirror to GitHub
+#
+# PR and development: validate only.
+# master:             validate, build the jar, mirror the source to the public GitHub repo, and cut
+#                     a GitHub Release carrying the jar, sources jar and javadoc jar.
+#
+# Maven Central is NOT published from here yet. Unlike npm, PyPI and NuGet, Central requires
+# GPG-signed artifacts, so it needs a Sonatype Central account and a signing key in the vault first.
+# Everything up to that point is wired, so adding it later is one step, not a rebuild.
+
+# There is deliberately no paths: exclude here. Excluding README.md looks like an easy saving, but
+# the mirror-to-GitHub step in this pipeline IS how the public repo gets updated - so a
+# documentation-only change would never reach a single reader. Running the suite for a typo fix is
+# the cheaper mistake.
+trigger:
+  branches:
+    include:
+      - master
+      - development
+
+pr:
+  branches:
+    include:
+      - master
+      - development
+
+pool:
+  name: tesseract-buildpool
+
+variables:
+  isMaster: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
+  githubRepo: 'TesseractSoftwares/Praxsuite-SDK-Java'
+  # Pinned, not "latest". A latest link turns an unrelated upstream release into a broken build, and
+  # Adoptium publishes a checksum for every asset so it is verified rather than trusted.
+  jdkVersion: '21.0.12.1_1'
+  jdkRelease: 'jdk-21.0.12.1%2B1'
+
+stages:
+
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: Validate
+  displayName: 'Test'
+  jobs:
+    - job: Validate
+      steps:
+        # A pinned JDK rather than JavaToolInstaller@0. That task wants the JDK in the agent's tool
+        # cache, and the equivalent Python task failed exactly that way on this pool - an empty
+        # cache with no usable fallback. Downloading a known JDK is deterministic and needs no
+        # agent-image cooperation.
+        - script: |
+            set -e
+            BASE="https://github.com/adoptium/temurin21-binaries/releases/download/$(jdkRelease)"
+            TARBALL="OpenJDK21U-jdk_x64_linux_hotspot_$(jdkVersion).tar.gz"
+
+            cd "$(Agent.TempDirectory)"
+            curl -fsSL "$BASE/$TARBALL" -o jdk.tar.gz
+            curl -fsSL "$BASE/$TARBALL.sha256.txt" -o jdk.sha256.txt
+
+            # Adoptium's file is "<sha>  <name>"; the name will not match ours, so compare hashes.
+            EXPECTED=$(cut -d' ' -f1 jdk.sha256.txt)
+            ACTUAL=$(sha256sum jdk.tar.gz | cut -d' ' -f1)
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "##vso[task.logissue type=error]JDK checksum mismatch. Expected $EXPECTED, got $ACTUAL."
+              exit 1
+            fi
+            echo "JDK checksum verified."
+
+            mkdir -p jdk && tar -xzf jdk.tar.gz -C jdk --strip-components=1
+            echo "##vso[task.setvariable variable=JAVA_HOME]$(Agent.TempDirectory)/jdk"
+            "$(Agent.TempDirectory)/jdk/bin/java" -version
+          displayName: 'Install JDK 21'
+
+        # The Gradle wrapper is committed, so there is no Gradle to install - it bootstraps the
+        # pinned distribution itself and verifies its own checksum from gradle-wrapper.properties.
+        - script: |
+            set -e
+            chmod +x ./gradlew
+            ./gradlew --version
+          displayName: 'Bootstrap Gradle'
+
+        - script: |
+            set -e
+            ./gradlew test --console=plain
+          displayName: 'Run tests'
+
+        - task: PublishTestResults@2
+          displayName: 'Publish test results'
+          condition: succeededOrFailed()
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '**/build/test-results/test/TEST-*.xml'
+            failTaskOnFailedTests: true
+
+        # An empty dependency list is a feature of this artifact, not an accident, so it is asserted
+        # against the generated POM rather than the build script - the POM is what a consumer
+        # actually resolves.
+        - script: |
+            set -e
+            ./gradlew generatePomFileForMavenJavaPublication --console=plain -q
+            POM=build/publications/mavenJava/pom-default.xml
+            test -f "$POM" || { echo "##vso[task.logissue type=error]No POM generated."; exit 1; }
+            if grep -q '<dependencies>' "$POM"; then
+              echo "##vso[task.logissue type=error]The published POM declares dependencies:"
+              sed -n '/<dependencies>/,/<\/dependencies>/p' "$POM"
+              exit 1
+            fi
+            echo "POM declares no dependencies, as intended."
+          displayName: 'Assert zero dependencies'
+
+        # This repo is mirrored to a PUBLIC GitHub repo, so a key committed here reaches every
+        # consumer.
+        - script: |
+            set -e
+            if grep -rEn 'sk_live_[A-Za-z0-9]{16,}' \
+                 --include='*.java' --include='*.kts' --include='*.md' --include='*.yml' \
+                 --include='*.properties' --exclude-dir=.git --exclude-dir=build \
+                 --exclude-dir=.gradle . ; then
+              echo "##vso[task.logissue type=error]A Praxsuite secret key is present. Revoke it now - this repo is mirrored publicly."
+              exit 1
+            fi
+            echo "No secret keys found."
+          displayName: 'Scan for leaked secret keys'
+
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: Publish
+  displayName: 'Build and mirror to GitHub'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables.isMaster, true))
+  jobs:
+    - job: Publish
+      steps:
+        # Full history: the mirror push needs real commits, not a shallow clone.
+        - checkout: self
+          fetchDepth: 0
+          persistCredentials: true
+
+        - script: |
+            set -e
+            BASE="https://github.com/adoptium/temurin21-binaries/releases/download/$(jdkRelease)"
+            TARBALL="OpenJDK21U-jdk_x64_linux_hotspot_$(jdkVersion).tar.gz"
+
+            cd "$(Agent.TempDirectory)"
+            curl -fsSL "$BASE/$TARBALL" -o jdk.tar.gz
+            curl -fsSL "$BASE/$TARBALL.sha256.txt" -o jdk.sha256.txt
+            EXPECTED=$(cut -d' ' -f1 jdk.sha256.txt)
+            ACTUAL=$(sha256sum jdk.tar.gz | cut -d' ' -f1)
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "##vso[task.logissue type=error]JDK checksum mismatch."
+              exit 1
+            fi
+            mkdir -p jdk && tar -xzf jdk.tar.gz -C jdk --strip-components=1
+            echo "##vso[task.setvariable variable=JAVA_HOME]$(Agent.TempDirectory)/jdk"
+          displayName: 'Install JDK 21'
+
+        - task: AzureKeyVault@2
+          displayName: 'Read publish secrets'
+          inputs:
+            azureSubscription: 'sc-acr-push-core-prod'
+            KeyVaultName: 'prax-cicd-kv'
+            SecretsFilter: 'GITHUB-SDK-MIRROR-TOKEN'
+            RunAsPreJob: false
+
+        # build.gradle.kts is the single source of truth for the version, so a release tag can never
+        # disagree with what a consumer resolves.
+        - script: |
+            set -e
+            VERSION=$(grep -m1 '^version = ' build.gradle.kts | cut -d'"' -f2)
+            if [ -z "$VERSION" ]; then
+              echo "##vso[task.logissue type=error]No version line in build.gradle.kts."
+              exit 1
+            fi
+            echo "Artifact version: $VERSION"
+            echo "##vso[task.setvariable variable=pkgVersion]$VERSION"
+          displayName: 'Read artifact version'
+
+        - script: |
+            set -e
+            chmod +x ./gradlew
+            ./gradlew clean build --console=plain
+            OUT="$(Build.ArtifactStagingDirectory)/package"
+            mkdir -p "$OUT"
+            cp build/libs/*.jar "$OUT"/
+            ls -la "$OUT"
+          displayName: 'Build jars'
+
+        # An artifact that exists is not an artifact that works. The TypeScript SDK published a 7 KB
+        # tarball containing no code, and every gate in that pipeline passed because each one checked
+        # for the artifact's presence rather than its contents.
+        - script: |
+            set -e
+            OUT="$(Build.ArtifactStagingDirectory)/package"
+            MAIN=$(ls "$OUT"/*.jar | grep -v -- '-sources.jar' | grep -v -- '-javadoc.jar' | head -1)
+            if [ -z "$MAIN" ]; then
+              echo "##vso[task.logissue type=error]No main jar produced. Contents:"
+              ls -la "$OUT"
+              exit 1
+            fi
+
+            CLASSES=$(unzip -l "$MAIN" | grep -c '\.class$' || true)
+            echo "$(basename "$MAIN") carries $CLASSES classes."
+            if [ "$CLASSES" -lt 15 ]; then
+              echo "##vso[task.logissue type=error]The jar does not contain the SDK. Contents:"
+              unzip -l "$MAIN"
+              exit 1
+            fi
+
+            # The bundled codec is what makes the zero-dependency claim work; if it is missing the
+            # artifact is unusable in a way no compile check would reveal.
+            if ! unzip -l "$MAIN" | grep -q 'com/tesseractsoftwares/praxsuite/json/Json.class'; then
+              echo "##vso[task.logissue type=error]The bundled JSON codec is missing from the jar."
+              exit 1
+            fi
+
+            # Sources and javadoc are what make the artifact pleasant in an IDE, and Maven Central
+            # will require both later.
+            ls "$OUT"/*-sources.jar >/dev/null 2>&1 || {
+              echo "##vso[task.logissue type=error]No sources jar."; exit 1; }
+            ls "$OUT"/*-javadoc.jar >/dev/null 2>&1 || {
+              echo "##vso[task.logissue type=error]No javadoc jar."; exit 1; }
+
+            echo "##vso[task.setvariable variable=mainJar]$MAIN"
+          displayName: 'Verify the jar carries the SDK'
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish jar artifacts'
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)/package'
+            ArtifactName: 'java-jars'
+
+        - script: |
+            set -e
+            git config user.email "ci@tesseractsoftwares.com"
+            git config user.name  "Tesseract CI"
+
+            git remote remove github 2>/dev/null || true
+            git remote add github "https://x-access-token:$(GITHUB-SDK-MIRROR-TOKEN)@github.com/$(githubRepo).git"
+
+            # Read the mirror's head BEFORE fetching. --force-with-lease cannot protect anything if a
+            # fetch runs first: fetching sets the remote-tracking ref to whatever GitHub currently
+            # has, so the lease always matches and the push always wins. That is not hypothetical -
+            # it silently reset commits pushed straight to a sibling SDK's mirror.
+            REMOTE_SHA=$(git ls-remote github refs/heads/master | cut -f1)
+            if [ -n "$REMOTE_SHA" ]; then
+              git fetch github master
+              if ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD; then
+                echo "##vso[task.logissue type=error]github.com/$(githubRepo) is at $REMOTE_SHA, which is not an ancestor of this build. Someone pushed to the mirror directly. Reconcile it - do not overwrite."
+                exit 1
+              fi
+            fi
+
+            echo "Mirroring master to github.com/$(githubRepo)"
+            if ! git push github HEAD:refs/heads/master; then
+              echo "##vso[task.logissue type=error]Mirror push failed. Check the token has contents:write on the mirror."
+              exit 1
+            fi
+            echo "Mirror complete."
+          displayName: 'Mirror source to GitHub'
+
+        # Every call captures the HTTP status and prints GitHub's response when it is not what we
+        # expect. curl -f is deliberately absent: it exits 22 with no message and no body, which cost
+        # three builds on a sibling SDK failing with an empty log.
+        - script: |
+            TAG="v$(pkgVersion)"
+            API="https://api.github.com/repos/$(githubRepo)"
+            AUTH="Authorization: Bearer $(GITHUB-SDK-MIRROR-TOKEN)"
+            OUT="$(Build.ArtifactStagingDirectory)/package"
+
+            CODE=$(curl -sS -o /tmp/existing.json -w '%{http_code}' -H "$AUTH" "$API/releases/tags/$TAG")
+            if [ "$CODE" = "200" ]; then
+              if grep -q '"state": *"uploaded"' /tmp/existing.json; then
+                echo "Release $TAG already exists with an asset attached - nothing to publish."
+                exit 0
+              fi
+              echo "##vso[task.logissue type=error]Release $TAG exists but has no asset attached. Delete it (or attach the asset by hand) and re-run."
+              exit 1
+            fi
+            if [ "$CODE" != "404" ]; then
+              echo "##vso[task.logissue type=error]HTTP $CODE checking whether $TAG exists. GitHub said:"
+              cat /tmp/existing.json; echo
+              exit 1
+            fi
+
+            # No double quotes and no newlines in the notes: escaped quotes here become real quotes
+            # once the shell expands them, and the body stops being valid JSON.
+            NOTES="Gradle: implementation com.tesseractsoftwares:praxsuite-sdk:$(pkgVersion) -- Java 17+, zero dependencies. See CHANGELOG.md for what changed."
+            CODE=$(curl -sS -o /tmp/release.json -w '%{http_code}' -X POST \
+              -H "$AUTH" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" \
+              "$API/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"Praxsuite SDK for Java $(pkgVersion)\",\"body\":\"$NOTES\",\"draft\":false,\"prerelease\":false}")
+            if [ "$CODE" != "201" ]; then
+              echo "##vso[task.logissue type=error]GitHub refused to create release $TAG (HTTP $CODE). It said:"
+              cat /tmp/release.json; echo
+              exit 1
+            fi
+
+            RELEASE_ID=$(grep -o '"id": *[0-9]*' /tmp/release.json | head -1 | tr -dc '0-9')
+            if [ -z "$RELEASE_ID" ]; then
+              echo "##vso[task.logissue type=error]Release $TAG created but its id could not be read from:"
+              cat /tmp/release.json; echo
+              exit 1
+            fi
+            echo "Created release $TAG (id $RELEASE_ID)"
+
+            UPLOADED=0
+            for F in "$OUT"/*.jar; do
+              [ -f "$F" ] || continue
+              # ${F##*/} rather than $(basename ...) - ADO reads $(...) as its own variable syntax
+              # and would pass the text through literally, producing a release with no asset while
+              # the build stayed green.
+              CODE=$(curl -sS -o /tmp/asset.json -w '%{http_code}' -X POST \
+                -H "$AUTH" -H "Content-Type: application/java-archive" \
+                --data-binary @"$F" \
+                "https://uploads.github.com/repos/$(githubRepo)/releases/$RELEASE_ID/assets?name=${F##*/}")
+              if [ "$CODE" != "201" ]; then
+                echo "##vso[task.logissue type=error]Uploading ${F##*/} returned HTTP $CODE. GitHub said:"
+                cat /tmp/asset.json; echo
+                exit 1
+              fi
+              echo "  uploaded ${F##*/}"
+              UPLOADED=$((UPLOADED + 1))
+            done
+
+            if [ "$UPLOADED" -lt 3 ]; then
+              echo "##vso[task.logissue type=error]Expected the main, sources and javadoc jars; uploaded $UPLOADED."
+              ls -la "$OUT"
+              exit 1
+            fi
+
+            ATTACHED=$(curl -sS -H "$AUTH" "$API/releases/tags/$TAG" | grep -c '"state": *"uploaded"')
+            if [ "$ATTACHED" -lt 3 ]; then
+              echo "##vso[task.logissue type=error]Release $TAG reports only $ATTACHED uploaded asset(s) after $UPLOADED successful uploads."
+              exit 1
+            fi
+
+            echo "Published release $TAG with $ATTACHED asset(s)"
+          displayName: 'Cut GitHub release'

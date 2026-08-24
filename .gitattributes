@@ -1,0 +1,5 @@
+# Sources, Gradle scripts and the pipeline are read by tools that expect LF.
+* text=auto eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf
+*.jar binary

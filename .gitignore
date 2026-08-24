@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+bin/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Signing material must never be committed
+*.gpg
+*.asc
+secring.*
+gradle.properties
