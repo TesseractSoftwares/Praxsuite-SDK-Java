@@ -90,4 +90,56 @@ publishing {
             }
         }
     }
+
+    // Both modules stage into one directory under the root build, so a single bundle carries both
+    // artifacts. Central validates and releases a bundle as a unit, and that is what we want here:
+    // praxsuite-sdk-kotlin depends on praxsuite-sdk, so releasing them separately would publish a
+    // Kotlin artifact whose own dependency is not resolvable yet.
+    //
+    // Publishing to a `file://` repository is also what produces the layout Central expects -
+    // `com/tesseractsoftwares/praxsuite-sdk/1.0.0/...` with checksums - so the bundle is a plain zip
+    // of this directory rather than anything assembled by hand.
+    repositories {
+        maven {
+            name = "centralStaging"
+            url = uri(rootProject.layout.buildDirectory.dir("central-staging"))
+        }
+    }
+}
+
+// Maven Central rejects unsigned artifacts outright. There is no unsigned path, unlike npm, PyPI and
+// NuGet, so a signing key has to exist in CI.
+//
+// The key arrives as an armoured string in the environment and is used in memory: the agent never
+// writes a secret to disk and there is no keyring to clean up afterwards. Signing is required only
+// when a key is actually present, so `./gradlew test` on a machine with no key still works rather
+// than failing on a task nobody asked for.
+signing {
+    val signingKey: String? = System.getenv("PRAX_SIGNING_KEY")
+    isRequired = !signingKey.isNullOrBlank()
+    if (isRequired) {
+        useInMemoryPgpKeys(signingKey, System.getenv("PRAX_SIGNING_PASSWORD"))
+        sign(publishing.publications)
+    }
+}
+
+// Zips the staged repository into the single bundle the Central Portal's Publisher API accepts.
+// Depends on both modules' publish tasks, so `./gradlew centralBundle` from the root is the whole
+// build-side of a release.
+tasks.register<Zip>("centralBundle") {
+    group = "publishing"
+    description = "Packages the staged Maven repository into a Central Portal upload bundle."
+
+    dependsOn(
+        ":publishMavenJavaPublicationToCentralStagingRepository",
+        ":praxsuite-sdk-kotlin:publishMavenKotlinPublicationToCentralStagingRepository",
+    )
+
+    from(layout.buildDirectory.dir("central-staging"))
+    // Gradle writes maven-metadata.xml into a file:// repository. Central rejects a bundle
+    // containing it, because metadata is the repository's to generate, not the publisher's.
+    exclude("**/maven-metadata.xml*")
+
+    destinationDirectory = layout.buildDirectory.dir("central-bundle")
+    archiveFileName = "praxsuite-sdk-${project.version}-bundle.zip"
 }

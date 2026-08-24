@@ -1,12 +1,9 @@
-# Praxsuite SDK for Java - validate, build, and mirror to GitHub
+# Praxsuite SDK for Java - validate, build, mirror to GitHub, and publish to Maven Central
 #
 # PR and development: validate only.
-# master:             validate, build the jar, mirror the source to the public GitHub repo, and cut
-#                     a GitHub Release carrying the jar, sources jar and javadoc jar.
-#
-# Maven Central is NOT published from here yet. Unlike npm, PyPI and NuGet, Central requires
-# GPG-signed artifacts, so it needs a Sonatype Central account and a signing key in the vault first.
-# Everything up to that point is wired, so adding it later is one step, not a rebuild.
+# master:             validate, build the jar, mirror the source to the public GitHub repo, cut a
+#                     GitHub Release carrying the jar, sources jar and javadoc jar, and - when
+#                     publishToCentral is true - upload a signed bundle to the Central Portal.
 
 # There is deliberately no paths: exclude here. Excluding README.md looks like an easy saving, but
 # the mirror-to-GitHub step in this pipeline IS how the public repo gets updated - so a
@@ -34,6 +31,21 @@ variables:
   # Adoptium publishes a checksum for every asset so it is verified rather than trusted.
   jdkVersion: '21.0.12.1_1'
   jdkRelease: 'jdk-21.0.12.1%2B1'
+
+  # Off until the three MAVEN-* secrets exist in prax-cicd-kv. AzureKeyVault@2 fails the task when a
+  # name in SecretsFilter is missing, so gating the whole stage keeps every other build green while
+  # the account is still being set up.
+  publishToCentral: 'false'
+
+  # USER_MANAGED, not AUTOMATIC, and this one is worth arguing for rather than defaulting.
+  #
+  # A Maven Central release is permanently immutable - there is no unpublish, no yank, and no 72-hour
+  # window like npm's. A bad artifact is public at that coordinate forever, and the only remedy is
+  # publishing another version and hoping people move. So the bundle is validated and staged by CI,
+  # and a person clicks Publish in the portal after looking at it. That is one click per release
+  # against a permanent mistake, which is a trade worth making - the TypeScript SDK shipped an empty
+  # tarball to npm through a fully green pipeline, and npm at least let us replace it.
+  centralPublishingType: 'USER_MANAGED'
 
 stages:
 
@@ -334,3 +346,213 @@ stages:
 
             echo "Published release $TAG with $ATTACHED asset(s)"
           displayName: 'Cut GitHub release'
+
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: Central
+  displayName: 'Publish to Maven Central'
+  dependsOn: Publish
+  condition: and(succeeded(), eq(variables.isMaster, true), eq(variables.publishToCentral, 'true'))
+  jobs:
+    - job: Central
+      steps:
+        - script: |
+            set -e
+            BASE="https://github.com/adoptium/temurin21-binaries/releases/download/$(jdkRelease)"
+            TARBALL="OpenJDK21U-jdk_x64_linux_hotspot_$(jdkVersion).tar.gz"
+
+            cd "$(Agent.TempDirectory)"
+            curl -fsSL "$BASE/$TARBALL" -o jdk.tar.gz
+            curl -fsSL "$BASE/$TARBALL.sha256.txt" -o jdk.sha256.txt
+            EXPECTED=$(cut -d' ' -f1 jdk.sha256.txt)
+            ACTUAL=$(sha256sum jdk.tar.gz | cut -d' ' -f1)
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "##vso[task.logissue type=error]JDK checksum mismatch."
+              exit 1
+            fi
+            mkdir -p jdk && tar -xzf jdk.tar.gz -C jdk --strip-components=1
+            echo "##vso[task.setvariable variable=JAVA_HOME]$(Agent.TempDirectory)/jdk"
+          displayName: 'Install JDK 21'
+
+        # The signing key is stored base64-encoded rather than as armoured text. An armoured PGP key
+        # is multi-line, and a multi-line value round-tripped through a pipeline variable is exactly
+        # the kind of thing that arrives subtly reflowed - at which point the key does not import and
+        # the error says nothing useful. Base64 is one line by construction.
+        - task: AzureKeyVault@2
+          displayName: 'Read Central secrets'
+          inputs:
+            azureSubscription: 'sc-acr-push-core-prod'
+            KeyVaultName: 'prax-cicd-kv'
+            SecretsFilter: 'MAVEN-SIGNING-KEY-B64,MAVEN-SIGNING-PASSWORD,MAVEN-CENTRAL-TOKEN'
+            RunAsPreJob: false
+
+        - script: |
+            set -e
+            VERSION=$(grep -m1 '^version = ' build.gradle.kts | cut -d'"' -f2)
+            test -n "$VERSION" || { echo "##vso[task.logissue type=error]No version line."; exit 1; }
+            echo "##vso[task.setvariable variable=pkgVersion]$VERSION"
+            echo "Publishing version $VERSION"
+          displayName: 'Read artifact version'
+
+        # Central refuses a coordinate that already exists, and it refuses it AFTER the upload as a
+        # validation failure rather than up front. Asking the repository first turns a confusing
+        # failed deployment into a clear message here.
+        - script: |
+            set -e
+            URL="https://repo1.maven.org/maven2/com/tesseractsoftwares/praxsuite-sdk/$(pkgVersion)/praxsuite-sdk-$(pkgVersion).pom"
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$URL")
+            if [ "$CODE" = "200" ]; then
+              echo "##vso[task.logissue type=error]com.tesseractsoftwares:praxsuite-sdk:$(pkgVersion) is already on Maven Central. A published coordinate is immutable - bump the version in build.gradle.kts."
+              exit 1
+            fi
+            echo "Version $(pkgVersion) is not on Central yet (HTTP $CODE)."
+          displayName: 'Check the version is unpublished'
+
+        - script: |
+            set -e
+            chmod +x ./gradlew
+
+            KEY_FILE="$(Agent.TempDirectory)/signing-key.asc"
+            printf '%s' "$MAVEN_SIGNING_KEY_B64" | base64 -d > "$KEY_FILE"
+            # A truncated or wrongly-encoded secret produces a file that is not a key at all, and
+            # Gradle's failure for that case is opaque. Check the armour header instead.
+            if ! head -1 "$KEY_FILE" | grep -q 'BEGIN PGP PRIVATE KEY BLOCK'; then
+              echo "##vso[task.logissue type=error]MAVEN-SIGNING-KEY-B64 did not decode to an armoured PGP private key. Re-store it as base64 of the full armoured export."
+              exit 1
+            fi
+
+            PRAX_SIGNING_KEY="$(cat "$KEY_FILE")" \
+            PRAX_SIGNING_PASSWORD="$MAVEN_SIGNING_PASSWORD" \
+              ./gradlew clean centralBundle --console=plain
+
+            rm -f "$KEY_FILE"
+          displayName: 'Build the signed bundle'
+          env:
+            MAVEN_SIGNING_KEY_B64: $(MAVEN-SIGNING-KEY-B64)
+            MAVEN_SIGNING_PASSWORD: $(MAVEN-SIGNING-PASSWORD)
+
+        # Central rejects an unsigned bundle, but it rejects it after the upload, in a deployment we
+        # then have to go and drop by hand. Counting the signatures here is free.
+        #
+        # Ten: five files per artifact (jar, sources, javadoc, pom, module) across two artifacts. A
+        # bundle with zero .asc files means signing silently no-op'd, which is exactly what happens
+        # when the key variable arrives empty - isRequired goes false and the build stays green.
+        - script: |
+            set -e
+            BUNDLE="build/central-bundle/praxsuite-sdk-$(pkgVersion)-bundle.zip"
+            test -f "$BUNDLE" || { echo "##vso[task.logissue type=error]No bundle at $BUNDLE."; ls -R build/central-bundle 2>/dev/null; exit 1; }
+
+            SIGS=$(unzip -l "$BUNDLE" | grep -c 'asc$' || true)
+            echo "Bundle carries $SIGS signature(s)."
+            if [ "$SIGS" -lt 10 ]; then
+              echo "##vso[task.logissue type=error]Expected 10 signatures, found $SIGS. Signing did not run over every artifact. Contents:"
+              unzip -l "$BUNDLE"
+              exit 1
+            fi
+
+            # Both coordinates have to ship in the one bundle: praxsuite-sdk-kotlin depends on
+            # praxsuite-sdk, so releasing them apart would publish a Kotlin artifact whose dependency
+            # does not resolve.
+            for A in praxsuite-sdk praxsuite-sdk-kotlin; do
+              if ! unzip -l "$BUNDLE" | grep -q "com/tesseractsoftwares/$A/$(pkgVersion)/$A-$(pkgVersion).jar"; then
+                echo "##vso[task.logissue type=error]$A-$(pkgVersion).jar is missing from the bundle."
+                unzip -l "$BUNDLE"
+                exit 1
+              fi
+            done
+
+            # Central rejects a bundle containing maven-metadata.xml - metadata is the repository's to
+            # generate. Gradle writes it into a file:// repo, so the exclude in centralBundle is
+            # load-bearing and worth asserting rather than trusting.
+            if unzip -l "$BUNDLE" | grep -q 'maven-metadata'; then
+              echo "##vso[task.logissue type=error]The bundle contains maven-metadata.xml, which Central rejects."
+              exit 1
+            fi
+
+            echo "##vso[task.setvariable variable=bundlePath]$BUNDLE"
+          displayName: 'Verify the bundle is signed and complete'
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish the bundle'
+          inputs:
+            PathtoPublish: 'build/central-bundle'
+            ArtifactName: 'central-bundle'
+
+        # MAVEN-CENTRAL-TOKEN holds base64("username:password") from the portal's Generate User Token
+        # screen - Central's Publisher API wants that whole blob after Bearer, which reads like a
+        # mistake but is what it documents.
+        #
+        # No curl -f anywhere: it exits 22 with no body and no message, which cost three builds on a
+        # sibling SDK failing with an empty log.
+        - script: |
+            set -e
+            BUNDLE="$(bundlePath)"
+            NAME="com.tesseractsoftwares:praxsuite-sdk:$(pkgVersion)"
+
+            CODE=$(curl -sS -o /tmp/upload.txt -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $MAVEN_CENTRAL_TOKEN" \
+              -F "bundle=@$BUNDLE" \
+              "https://central.sonatype.com/api/v1/publisher/upload?name=$NAME&publishingType=$(centralPublishingType)")
+
+            if [ "$CODE" != "201" ]; then
+              echo "##vso[task.logissue type=error]Central refused the bundle (HTTP $CODE). It said:"
+              cat /tmp/upload.txt; echo
+              exit 1
+            fi
+
+            DEPLOYMENT=$(tr -d '\r\n "' < /tmp/upload.txt)
+            if [ -z "$DEPLOYMENT" ]; then
+              echo "##vso[task.logissue type=error]Upload returned 201 but no deployment id. Body was:"
+              cat /tmp/upload.txt; echo
+              exit 1
+            fi
+            echo "Deployment $DEPLOYMENT accepted. Waiting for validation."
+            echo "##vso[task.setvariable variable=deploymentId]$DEPLOYMENT"
+          displayName: 'Upload the bundle to Central'
+          env:
+            MAVEN_CENTRAL_TOKEN: $(MAVEN-CENTRAL-TOKEN)
+
+        # A 201 means Central took the file, not that the file is good. Validation is asynchronous and
+        # can fail minutes later on a missing POM field or a signature it cannot verify - so a build
+        # that stops at the upload reports success for a deployment that never publishes.
+        - script: |
+            set -e
+            API="https://central.sonatype.com/api/v1/publisher/status?id=$(deploymentId)"
+
+            for I in $(seq 1 40); do
+              CODE=$(curl -sS -o /tmp/status.json -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $MAVEN_CENTRAL_TOKEN" "$API")
+              if [ "$CODE" != "200" ]; then
+                echo "##vso[task.logissue type=error]HTTP $CODE reading deployment status. Central said:"
+                cat /tmp/status.json; echo
+                exit 1
+              fi
+
+              STATE=$(grep -o '"deploymentState" *: *"[A-Z_]*"' /tmp/status.json | head -1 | cut -d'"' -f4)
+              echo "  [$I/40] $STATE"
+
+              case "$STATE" in
+                FAILED)
+                  echo "##vso[task.logissue type=error]Central failed validation. Full response:"
+                  cat /tmp/status.json; echo
+                  echo "Drop the deployment at https://central.sonatype.com/publishing/deployments before re-running."
+                  exit 1
+                  ;;
+                VALIDATED)
+                  echo ""
+                  echo "Deployment $(deploymentId) is validated and STAGED, not released."
+                  echo "Release it at https://central.sonatype.com/publishing/deployments"
+                  echo "A Central release is permanent - check the artifacts, then click Publish."
+                  exit 0
+                  ;;
+                PUBLISHING|PUBLISHED)
+                  echo "Deployment $STATE. It reaches Maven Central within ~15 minutes and search within a few hours."
+                  exit 0
+                  ;;
+              esac
+              sleep 15
+            done
+
+            echo "##vso[task.logissue type=warning]Still $STATE after 10 minutes. Check https://central.sonatype.com/publishing/deployments - the deployment is live, this build just stopped watching it."
+          displayName: 'Wait for Central validation'
+          env:
+            MAVEN_CENTRAL_TOKEN: $(MAVEN-CENTRAL-TOKEN)

@@ -50,6 +50,38 @@ dependencies {
 Java **17 or newer**. Compiled with `--release 17`, so it runs on Paper 1.20.x (Java 17) and 1.21
 (Java 21) alike.
 
+### Kotlin
+
+The Java SDK works from Kotlin as-is. If you'd rather have coroutines and a query DSL, add the
+extensions artifact — it depends on this one, so you get both:
+
+```kotlin
+dependencies {
+    implementation("com.tesseractsoftwares:praxsuite-sdk-kotlin:1.0.0")
+}
+```
+
+```kotlin
+val page = prax.data.table("Orders")
+    .select("ID", "Total")
+    .where { gte("Total", 100); eq("Status", "paid") }
+    .orderByDescending("Total")
+    .fetchAsync()
+```
+
+Every terminal has a `suspend` form, and `where { }` builds the same request the static `Filters`
+calls do — there's a test asserting the two produce an identical body, because a DSL that quietly
+sends something else is worse than no DSL.
+
+One honest caveat: the underlying calls are blocking, so the `suspend` functions run on
+`Dispatchers.IO`. Your coroutine suspends instead of parking on a blocked thread, which is the point
+in a Ktor handler — but it isn't native async I/O, and calling it that would be a lie.
+
+**Zero dependencies applies to the Java artifact only.** The Kotlin one necessarily pulls in
+`kotlin-stdlib` and `kotlinx-coroutines-core`. That's the trade: plugin authors who can't afford a
+classloader argument take the Java artifact, and Kotlin users who already ship a stdlib get the
+nicer face.
+
 ## Configure
 
 ```java
@@ -264,7 +296,8 @@ The suite is offline — no workspace, no network, no credentials:
 ./gradlew test
 ```
 
-50 checks: 16 for the bundled JSON codec, 34 for the contract.
+62 checks: 16 for the bundled JSON codec, 34 for the contract, and 12 asserting the Kotlin
+extensions send exactly what the Java calls do.
 
 ## API surface
 
