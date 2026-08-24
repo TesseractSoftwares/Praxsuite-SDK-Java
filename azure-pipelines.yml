@@ -32,10 +32,10 @@ variables:
   jdkVersion: '21.0.12.1_1'
   jdkRelease: 'jdk-21.0.12.1%2B1'
 
-  # Off until the three MAVEN-* secrets exist in prax-cicd-kv. AzureKeyVault@2 fails the task when a
-  # name in SecretsFilter is missing, so gating the whole stage keeps every other build green while
-  # the account is still being set up.
-  publishToCentral: 'false'
+  # The three MAVEN-* secrets exist in prax-cicd-kv as of 2026-08-24, so this is on. The gate stays
+  # because AzureKeyVault@2 fails the task when a name in SecretsFilter is missing - turning it off
+  # is how you keep every other build green if a secret ever has to be pulled.
+  publishToCentral: 'true'
 
   # USER_MANAGED, not AUTOMATIC, and this one is worth arguing for rather than defaulting.
   #
