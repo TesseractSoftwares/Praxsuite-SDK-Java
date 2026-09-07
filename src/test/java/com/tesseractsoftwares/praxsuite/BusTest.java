@@ -255,7 +255,7 @@ class BusTest {
 
         private Praxsuite client() {
             return Praxsuite.builder()
-                .workspaceId("1eb92f32-d628-4656-8c64-cd0d43c9869d")
+                .workspaceId("00000000-0000-4000-8000-0000000000ff")
                 .credential("pk_live_" + "fedcba9876543210fedcba9876543210")
                 .baseUrl("https://gateway.example.test")
                 .build();
