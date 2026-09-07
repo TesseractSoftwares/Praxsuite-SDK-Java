@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.tesseractsoftwares"
-version = "1.0.0"
+version = "1.1.0"
 
 // Java 17, not 21. Paper 1.20.x runs on 17 and 1.21 on 21, so 17 reaches both - and Minecraft
 // plugin developers are the audience that asked for a Java SDK rather than using the Kotlin or

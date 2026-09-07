@@ -38,7 +38,7 @@ import java.util.Map;
  */
 public final class Praxsuite {
 
-    public static final String SDK_VERSION = "1.0.0";
+    public static final String SDK_VERSION = "1.1.0";
 
     private final String workspaceId;
     private final String baseUrl;
@@ -48,6 +48,7 @@ public final class Praxsuite {
     private final PraxData data;
     private final PraxEndpoints endpoints;
     private final PraxSchema schema;
+    private final PraxBus bus;
 
     private Praxsuite(Builder b) {
         String ws = firstNonBlank(b.workspaceId, System.getenv("PRAXSUITE_WORKSPACE_ID"));
@@ -83,6 +84,9 @@ public final class Praxsuite {
         this.data = new PraxData(this);
         this.endpoints = new PraxEndpoints(this);
         this.schema = new PraxSchema(this);
+        // Constructed eagerly so bus() never returns null; it opens no socket until a channel
+        // is joined.
+        this.bus = new PraxBus(this);
 
         PraxLog.info("Configured for workspace " + this.workspaceId + " at " + this.baseUrl
             + " using " + KeyGuard.redact(this.credential) + " (SDK " + SDK_VERSION + ")");
@@ -97,6 +101,12 @@ public final class Praxsuite {
     public PraxData data() { return data; }
     public PraxEndpoints endpoints() { return endpoints; }
     public PraxSchema schema() { return schema; }
+
+    /**
+     * The Event Bus: ephemeral realtime between connected clients. Needs a signed-in end user,
+     * not the workspace credential.
+     */
+    public PraxBus bus() { return bus; }
 
     /** Shorthand for {@code data().table(name)}. */
     public Query table(String nameOrId) { return data.table(nameOrId); }

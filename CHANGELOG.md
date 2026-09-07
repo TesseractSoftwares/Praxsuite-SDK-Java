@@ -2,6 +2,26 @@
 
 All notable changes to the Praxsuite SDK for Java.
 
+## [1.1.0] - 2026-09-07
+
+### Added
+
+- **`prax.bus()` - the Event Bus.** Ephemeral realtime between connected clients.
+  `prax.bus().topic("office").channel("hq")` gives a channel with `join`, `publish`, `leave`
+  and `on`, plus presence and the caller's own `prax.bus().self()`. Reconnects with backoff and
+  re-joins every channel, because SignalR group membership does not survive a reconnect and a
+  client that only reconnects is connected, in no groups, and silent.
+
+  It runs on `java.net.http.WebSocket` from the JDK and adds no dependency.
+  `com.microsoft.signalr` would drag in RxJava and OkHttp, and a shaded, version-skewed copy of
+  either inside a Paper server classloader is one of the classic ways a plugin breaks a server
+  it did not ship with.
+
+- **External sign-in**: `auth().providers()`, `auth().startOidcLogin()` and
+  `auth().completeOidcLogin()`. The callback carries `providerSlug` and `redirectUri` as well as
+  the code and state, because the gateway requires all four - it scopes its one-time state per
+  provider and compares the redirect URI against the provider's configured value. Three other
+  SDKs shipped this call with only code and state, which cannot ever have worked.
 ## [1.0.0] - 2026-08-24
 
 First release. Zero dependencies, Java 17+.
