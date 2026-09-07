@@ -3,6 +3,9 @@ package com.tesseractsoftwares.praxsuite;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
@@ -306,6 +309,126 @@ public final class PraxAuth {
         String url = Routes.auth(client.baseUrl(), client.workspaceId(), "config");
         return Responses.unwrapEnvelope(
             client.transport().requestJson("GET", url, client.anonymousHeaders(), null, true, null));
+    }
+
+    // ── external identity providers ─────────────────────────────────────────
+
+    /** One external identity provider the workspace has configured. */
+    public record OidcProvider(String slug, String displayName) { }
+
+    /**
+     * Where to send the user, and the CSRF token to bring back.
+     *
+     * @param authorizationUrl open this in a browser
+     * @param state            one-time value the gateway issued and will consume on the
+     *                         callback; the provider echoes it back on the redirect, so it can
+     *                         usually be read from there - it is returned here so nobody has to
+     *                         parse it out of a URL
+     */
+    public record OidcStart(String authorizationUrl, String state) { }
+
+    /**
+     * The external identity providers this workspace has configured.
+     *
+     * <p>Read from {@code oidcProviders} in the public config. {@code
+     * authPageConfig.enabledSocialProviders} is a different list, written by the portal's
+     * auth-page designer - a provider named there but absent here is not configured, and its
+     * button is a dead end.
+     */
+    @SuppressWarnings("unchecked")
+    public List<OidcProvider> providers() {
+        Object raw = config().get("oidcProviders");
+        if (!(raw instanceof List<?> entries)) {
+            return List.of();
+        }
+
+        List<OidcProvider> found = new ArrayList<>();
+        for (Object entry : entries) {
+            if (entry instanceof String slug && !slug.isEmpty()) {
+                found.add(new OidcProvider(slug, slug));
+            } else if (entry instanceof Map) {
+                Map<String, Object> provider = (Map<String, Object>) entry;
+                Object slug = provider.get("slug");
+                if (slug instanceof String text && !text.isEmpty()) {
+                    Object label = provider.get("displayName");
+                    found.add(new OidcProvider(text,
+                        label instanceof String name && !name.isEmpty() ? name : text));
+                }
+            }
+        }
+        return List.copyOf(found);
+    }
+
+    /**
+     * Starts a sign-in with an external identity provider.
+     *
+     * <p>Returns where to send the user and the one-time {@code state} the gateway issued. Open
+     * the URL in a browser; the provider sends the user back to the redirect URI configured for
+     * it in the portal, carrying {@code code} and {@code state}. Hand all of it to
+     * {@link #completeOidcLogin}.
+     *
+     * <p>Only the authorization-code flow exists - there is no route that accepts a provider's
+     * own id_token - so even a native button has to make this browser hop.
+     */
+    public OidcStart startOidcLogin(String providerSlug) {
+        if (providerSlug == null || providerSlug.isBlank()) {
+            throw new PraxValidationError("INVALID_ARGUMENT", "providerSlug is required.");
+        }
+
+        String url = Routes.auth(client.baseUrl(), client.workspaceId(),
+            "oidc/" + URLEncoder.encode(providerSlug.strip(), StandardCharsets.UTF_8));
+        Map<String, Object> payload = Responses.unwrapEnvelope(client.transport()
+            .requestJson("GET", url, client.anonymousHeaders(), null, true, null));
+
+        Object authorizationUrl = payload.get("authorizationUrl");
+        if (!(authorizationUrl instanceof String text) || text.isEmpty()) {
+            authorizationUrl = payload.get("url");
+        }
+        if (!(authorizationUrl instanceof String link) || link.isEmpty()) {
+            throw new PraxError("OIDC_NO_URL",
+                "The gateway returned no authorization URL for provider \"" + providerSlug
+                + "\". Check that it is configured and enabled for this workspace.");
+        }
+
+        Object state = payload.get("state");
+        return new OidcStart(link, state instanceof String value ? value : "");
+    }
+
+    /**
+     * Exchanges the provider's code for a Praxsuite session.
+     *
+     * <p>All four values are required by the gateway, and three of them are why this call fails
+     * when it fails. {@code providerSlug} scopes the one-time state, so omitting it makes every
+     * callback look expired. {@code state} is consumed once; reusing or skipping it is rejected.
+     * {@code redirectUri} is compared against the value configured for that provider and must
+     * match exactly - pass the URI you were actually redirected to rather than rebuilding it,
+     * which is how it ends up differing by a trailing slash and failing with a message about
+     * redirect URIs that nobody can act on.
+     *
+     * <p>The session is stored exactly as a password login stores it, so refresh, sign-out and
+     * every authenticated call behave identically afterwards.
+     *
+     * <p>An email already registered as a local password account comes back as a 400 rather than
+     * a session; the user's fix is to sign in with their password.
+     */
+    public Session completeOidcLogin(String providerSlug, String code, String state,
+                                     String redirectUri) {
+        require(providerSlug, "providerSlug");
+        require(code, "code");
+        require(state, "state");
+        require(redirectUri, "redirectUri");
+
+        return adopt(Session.fromPayload(post("oidc/callback", Map.of(
+            "providerSlug", providerSlug,
+            "code", code,
+            "state", state,
+            "redirectUri", redirectUri)), null));
+    }
+
+    private static void require(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new PraxValidationError("INVALID_ARGUMENT", name + " is required.");
+        }
     }
 
     // ── plumbing ────────────────────────────────────────────────────────────

@@ -299,6 +299,103 @@ The suite is offline — no workspace, no network, no credentials:
 62 checks: 16 for the bundled JSON codec, 34 for the contract, and 12 asserting the Kotlin
 extensions send exactly what the Java calls do.
 
+## The Event Bus
+
+Ephemeral realtime between connected clients: player positions, cursors, "is typing", a lobby.
+State that is *changing*, where losing a message is fine because a newer one is 100ms behind it.
+
+```java
+prax.auth().login(email, password);   // the bus needs a signed-in user, not the credential
+
+PraxChannel room = prax.bus().topic("office").channel("hq");   // the bus "office:hq"
+
+room.on("move", e -> moveAvatar(e.fromUserId(), e.payload()));
+room.onPeerLeft(this::removeAvatar);
+
+// join() returns everyone already there, so a late arrival sees the room rather than an
+// empty one until somebody happens to move.
+for (var peer : room.join()) {
+    moveAvatar(peer.userId(), peer.payload());
+}
+
+room.publish("move", Map.of("x", x, "y", y));
+```
+
+**A topic must exist before anyone can join it.** Declare it once in the portal under
+API Gateway / Event Bus and pick its access rule: open to any signed-in user, gated on a role
+from their token, or gated on a grant on that one bus instance. An undeclared topic is refused -
+which is what stops another application's client squatting in your namespace.
+
+`prax.bus().self()` is the caller's own bus, `user:self`. The server resolves it to their id, so
+it can never address anybody else.
+
+Three things about it are not obvious and will bite:
+
+- **Nothing is persisted.** No history, no retry, no delivery to somebody who was not connected.
+  The test is one question: *if this is lost, does it matter?* Yes - a purchase, a score, an
+  inventory grant - means a table via `prax.data()`, or an automation, and a server-authoritative
+  one at that. No, because a newer one is coming, means the bus.
+- **Payloads are hostile.** The bus relays opaque JSON between *users* and parses none of it, so
+  every server-side check is bypassed. A position is a hint, never an authority.
+- **You never receive your own event.** Apply your own change locally.
+
+`publish` does not throw when the bus refuses a frame - a tick loop that throws on a rate limit
+is worse than one that skips a frame. Read the result when you care:
+
+```java
+var r = room.publish("move", Map.of("x", x, "y", y));
+if (!r.ok()) log(r.error());          // e.g. "rate_limited"
+if (r.recipients() == 0) { }          // it went out, and nobody was joined
+```
+
+`join` is the opposite and throws: a publish that does not land is one lost frame, a join that
+does not land leaves this client silently absent for the whole session.
+
+Handlers run on the WebSocket's own thread. In a Paper or Spigot plugin, hand anything that
+touches the world to `Bukkit.getScheduler().runTask(...)` from inside the handler rather than
+doing it there.
+
+Reconnects are handled: the socket comes back with backoff and every channel you still want is
+re-joined, because SignalR group membership does not survive a reconnect - a client that only
+reconnects is connected, in no groups, and looks for all the world like a broken server.
+
+It runs on `java.net.http.WebSocket` from the JDK, so it adds no dependency. That matters most
+here: `com.microsoft.signalr` would drag in RxJava and OkHttp, and a shaded, version-skewed copy
+of either inside a server classloader is one of the classic ways a plugin breaks a server it did
+not ship with.
+
+---
+
+## Signing in with an external provider
+
+```java
+for (var provider : prax.auth().providers()) {
+    addButton(provider.slug(), provider.displayName());
+}
+
+var start = prax.auth().startOidcLogin("tesseract");
+openInBrowser(start.authorizationUrl());        // keep start.state()
+
+// ...once the provider has redirected back with code and state:
+prax.auth().completeOidcLogin(
+    "tesseract", code, state,
+    "https://app.example/callback");   // byte-identical to the configured redirect URI
+```
+
+All four arguments are required, and three of them are why an external sign-in fails when it
+fails: the gateway scopes its one-time `state` per provider, consumes it once, and compares the
+redirect URI against the value configured for that provider. Pass the URI you were actually
+redirected to rather than rebuilding it - that is how it ends up differing by a trailing slash
+and failing with a message about redirect URIs that nobody can act on.
+
+The session lands in the same place a password login puts it, so refresh, sign-out and every
+authenticated call behave identically afterwards.
+
+Only the authorization-code flow exists. There is no route that accepts a provider's own
+`id_token`, so even a native button has to make the browser hop.
+
+---
+
 ## API surface
 
 | | |
@@ -308,6 +405,7 @@ extensions send exactly what the Java calls do.
 | `prax.data()` | `table(name)` → query builder; `insert` `insertMany` `update` `updateById` `delete` `deleteById` `upsert` `execute` |
 | `prax.endpoints()` | `call` |
 | `prax.schema()` | `tables` `table` `columns` `hasTable` |
+| `prax.bus()` | `topic(key).channel(instance)`, `channel(busKey)`, `self()`, `connect()`, `close()`; a channel has `join` `publish` `leave` `peers` `on` `onAny` `onPeerJoined` `onPeerLeft` `onEvicted` |
 | `Filters` | `eq neq gt gte lt lte like ilike contains textSearch startsWith endsWith isNull isNotNull in between anyOf allOf` |
 
 ## Licence
