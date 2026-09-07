@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Test
 class ExtensionsTest {
 
     private val fakeSecret = "sk_live_" + "0123456789abcdef0123456789abcdef"
-    private val ws = "1eb92f32-d628-4656-8c64-cd0d43c9869d"
+    private val ws = "00000000-0000-4000-8000-0000000000ff"
 
     private fun client(): Praxsuite = Praxsuite.builder()
         .workspaceId(ws)

@@ -24,7 +24,7 @@ class ConformanceTest {
     private static final String FAKE_SECRET = "sk_live_" + "0123456789abcdef0123456789abcdef";
     private static final String FAKE_PUBLISHABLE = "pk_live_" + "fedcba9876543210fedcba9876543210";
     private static final String FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYmMifQ.signaturehere";
-    private static final String WS = "1eb92f32-d628-4656-8c64-cd0d43c9869d";
+    private static final String WS = "00000000-0000-4000-8000-0000000000ff";
 
     @Nested
     @DisplayName("filters build the gateway wire shape")
