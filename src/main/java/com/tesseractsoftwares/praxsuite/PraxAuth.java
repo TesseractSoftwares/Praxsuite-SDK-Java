@@ -1,6 +1,7 @@
 package com.tesseractsoftwares.praxsuite;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.net.URLEncoder;
@@ -49,7 +50,13 @@ public final class PraxAuth {
             this.userId = userId;
             this.email = email;
             this.displayName = displayName;
-            this.profile = profile == null ? Map.of() : Map.copyOf(profile);
+            // Map.copyOf (used elsewhere in this SDK for immutability) throws on a null value, and
+            // a workspace's user profile legitimately has one - an unset avatarUrl or username
+            // comes back as JSON null, not an absent key. LinkedHashMap tolerates that; Map.copyOf
+            // does not.
+            this.profile = profile == null
+                ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(profile));
         }
 
         public String accessToken() { return accessToken; }
@@ -185,7 +192,7 @@ public final class PraxAuth {
 
         Session created = null;
         if (!requires && payload.get("accessToken") != null) {
-            created = adopt(Session.fromPayload(payload, null));
+            created = adoptInternal(Session.fromPayload(payload, null));
         }
         return new RegistrationResult(requires, created, message);
     }
@@ -194,7 +201,7 @@ public final class PraxAuth {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("email", email);
         body.put("password", password);
-        return adopt(Session.fromPayload(post("login", body), null));
+        return adoptInternal(Session.fromPayload(post("login", body), null));
     }
 
     /**
@@ -264,7 +271,7 @@ public final class PraxAuth {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("refreshToken", current.refreshToken());
         try {
-            return adopt(Session.fromPayload(post("refresh", body), current));
+            return adoptInternal(Session.fromPayload(post("refresh", body), current));
         } catch (PraxError e) {
             // A rejected refresh token is final. A network blip is not - keep the session, since
             // the existing token may still work.
@@ -418,11 +425,86 @@ public final class PraxAuth {
         require(state, "state");
         require(redirectUri, "redirectUri");
 
-        return adopt(Session.fromPayload(post("oidc/callback", Map.of(
+        return adoptInternal(Session.fromPayload(post("oidc/callback", Map.of(
             "providerSlug", providerSlug,
             "code", code,
             "state", state,
             "redirectUri", redirectUri)), null));
+    }
+
+    // ── server-asserted (platform) identity ──────────────────────────────────
+
+    /**
+     * Opens a session for one of your game's players, on your own server's word - no login screen
+     * shown to them. This is how a Roblox experience or a Minecraft server in {@code online-mode}
+     * signs a player in: there is no browser to redirect through, so {@link #startOidcLogin} does
+     * not apply.
+     *
+     * <p><b>Requires a secret key ({@code sk_live_})</b> that the portal has marked for {@code
+     * providerSlug} under Settings &gt; API Gateway - never a publishable key. The gateway trusts
+     * whoever holds that key, not {@code platformPlayerId} itself, so read the id from a source the
+     * player cannot forge: the platform's own server-side API (Bukkit's {@code Player.getUniqueId()}
+     * under {@code online-mode:true}, Roblox's {@code player.UserId}, etc.), never a client-supplied
+     * claim.
+     *
+     * <p><b>Does not become the client's ambient session.</b> {@link #login} and {@link
+     * #completeOidcLogin} install their result as {@code auth.session()} because an app normally
+     * signs in one user at a time. A game server is not that: it asserts many players concurrently
+     * on one shared {@link Praxsuite} instance, and installing the last-asserted player's session as
+     * "the" session would let one player's requests run - and row-filter - as another. Keep the
+     * returned {@link Session} yourself, keyed by player, and pass its {@link Session#accessToken()}
+     * explicitly wherever a call needs to act as that specific player (e.g. via {@code
+     * prax.endpoints().call}).
+     *
+     * <p>Sessions from this path are marked "server asserted" by the gateway - enough to carry roles
+     * and own data, deliberately a lower trust tier than a player who completed the platform's own
+     * interactive login. A new account gets whatever default roles the provider is configured with;
+     * many workspaces prefer to assign roles explicitly afterwards (via an endpoint that validates
+     * this session's access token) instead, since a provider's static default applies to every
+     * platform-asserted signup the same way.
+     *
+     * @param providerSlug     the identity provider's slug, e.g. {@code "minecraft"}
+     * @param platformPlayerId the player's id on that platform, server-side, never client-supplied
+     */
+    public Session assertPlayer(String providerSlug, String platformPlayerId) {
+        return assertPlayer(providerSlug, platformPlayerId, null, null, null);
+    }
+
+    /** Like {@link #assertPlayer(String, String)}, with a cosmetic display name. */
+    public Session assertPlayer(String providerSlug, String platformPlayerId, String displayName) {
+        return assertPlayer(providerSlug, platformPlayerId, displayName, null, null);
+    }
+
+    /**
+     * Full form of {@link #assertPlayer(String, String)}. {@code displayName} and {@code avatarUrl}
+     * are cosmetic only - never used for matching or authorization. {@code metadata} is free-form and
+     * stored as given.
+     */
+    public Session assertPlayer(String providerSlug, String platformPlayerId, String displayName,
+                                String avatarUrl, Map<String, Object> metadata) {
+        require(providerSlug, "providerSlug");
+        require(platformPlayerId, "platformPlayerId");
+        KeyGuard.requireServerKey(client.credential(), "Praxsuite.auth().assertPlayer()");
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("platformPlayerId", platformPlayerId);
+        if (displayName != null && !displayName.isBlank()) body.put("displayName", displayName);
+        if (avatarUrl != null && !avatarUrl.isBlank()) body.put("avatarUrl", avatarUrl);
+        if (metadata != null && !metadata.isEmpty()) body.put("metadata", metadata);
+
+        String action = URLEncoder.encode(providerSlug.strip(), StandardCharsets.UTF_8) + "/assert";
+        return requireValid(Session.fromPayload(post(action, body), null));
+    }
+
+    /**
+     * Validates a parsed session without installing it as the client's ambient session - see
+     * {@link #assertPlayer(String, String)} for why that distinction matters here.
+     */
+    private static Session requireValid(Session candidate) {
+        if (!candidate.isValid()) {
+            throw new PraxError("MALFORMED_RESPONSE", "The gateway returned no access token.");
+        }
+        return candidate;
     }
 
     private static void require(String value, String name) {
@@ -431,9 +513,26 @@ public final class PraxAuth {
         }
     }
 
+    /**
+     * Installs an already-obtained session (typically from {@link #assertPlayer}) as this
+     * client's ambient session - the one {@code prax.bus()} and every request without an explicit
+     * override authenticates as.
+     *
+     * <p>{@code assertPlayer} deliberately does not do this for you: a game server asserts many
+     * players concurrently on one shared {@link Praxsuite} instance, and this call replaces
+     * whichever session was ambient before. Call it only on a {@link Praxsuite} instance dedicated
+     * to a single identity for its whole lifetime - a bot account backing a background listener,
+     * for instance - never on the instance a game server also uses to assert its players, or every
+     * subsequent request there would authenticate as this one adopted identity instead of the
+     * server key.
+     */
+    public Session adopt(Session session) {
+        return adoptInternal(session);
+    }
+
     // ── plumbing ────────────────────────────────────────────────────────────
 
-    private Session adopt(Session candidate) {
+    private Session adoptInternal(Session candidate) {
         if (!candidate.isValid()) {
             throw new PraxError("MALFORMED_RESPONSE", "The gateway returned no access token.");
         }

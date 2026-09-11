@@ -116,6 +116,9 @@ public final class Praxsuite {
 
     Http transport() { return transport; }
 
+    /** The raw credential, for SDK-internal checks (e.g. {@link KeyGuard}) that inspect its shape. */
+    String credential() { return credential; }
+
     /** Headers for a call that must NOT carry a user's session: sign-in, and auth/config. */
     Map<String, String> anonymousHeaders() {
         Map<String, String> h = baseHeaders();
