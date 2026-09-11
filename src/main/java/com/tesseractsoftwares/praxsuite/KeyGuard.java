@@ -51,6 +51,26 @@ public final class KeyGuard {
         }
     }
 
+    /**
+     * Throws when the credential is not a secret key.
+     *
+     * <p>The mirror image of {@link #requireClientSafe}: some gateway routes trust the KEY as the
+     * proof of who is calling, so a publishable key - one any player could read out of a client -
+     * must never be accepted there. Server-assertion login is the case in this SDK; the gateway
+     * enforces the same rule server-side, but failing here is a clearer error than a 403 from across
+     * the network.
+     *
+     * @throws PraxValidationError if the credential is not {@code sk_live_}.
+     */
+    public static void requireServerKey(String credential, String context) {
+        if (!isSecret(credential)) {
+            throw new PraxValidationError("PUBLISHABLE_KEY_REFUSED",
+                context + " requires a secret key (sk_live_...), not a publishable one. This call "
+                    + "asserts a player's identity on your server's word, so the gateway trusts "
+                    + "whoever holds the key - never a key a player's own client could read.");
+        }
+    }
+
     /** Masks a credential for display, keeping only enough to identify which one it was. */
     public static String redact(String credential) {
         if (credential == null || credential.isEmpty()) return "<empty>";
