@@ -26,12 +26,13 @@ pool:
 
 variables:
   # Los secretos de publicacion salian de prax-cicd-kv, que vive en la
-  # suscripcion de Azure bloqueada el 2026-09-15. Las lecturas todavia
-  # funcionan, pero si esa suscripcion llega a eliminarse el pipeline se cae.
-  # Este grupo es NATIVO de ADO: no se le agrega gcloud a un pipeline que no lo
-  # necesita para nada mas. Los nombres de variable son identicos a los del
-  # vault, asi que las referencias $(...) de mas abajo no cambian.
-  - group: sdk-publish
+  # suscripcion de Azure bloqueada el 2026-09-15. Ahora vienen de Secret Manager
+  # de GCP, donde los 46 secretos de ese vault ya estaban replicados desde el
+  # 2026-09-09: una sola fuente de verdad, no dos copias que se desincronizan.
+  # El grupo gcp-migration aporta GCP_SA_KEY_B64.
+  - group: gcp-migration
+  - name: gcpProject
+    value: 'praxsuite-prod'
   - name: isMaster
     value: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
   - name: githubRepo
@@ -43,14 +44,14 @@ variables:
   - name: jdkRelease
     value: 'jdk-21.0.12.1%2B1'
 
-  # Los tres MAVEN-* ahora viven en el grupo sdk-publish, asi que esto sigue on.
+  # Los tres MAVEN-* viven en Secret Manager de GCP, asi que esto sigue on.
   #
-  # OJO, cambio de comportamiento respecto de Key Vault: AzureKeyVault@2 fallaba
-  # la tarea si un nombre del SecretsFilter no existia, y esta compuerta existia
-  # para poder apagar Central sin romper el resto. Un grupo de variables NO
-  # falla: una variable ausente llega vacia. Si algun dia se saca un MAVEN-* del
-  # grupo, hay que bajar esta compuerta a mano o la publicacion fallara mas
-  # adelante y de forma menos clara.
+  # La compuerta conserva su razon de ser: AzureKeyVault@2 fallaba la tarea si
+  # faltaba un nombre del SecretsFilter, y apagar Central era como se evitaba
+  # que eso tumbara el resto del pipeline. gcp-secrets.yml se comporta igual
+  # -- `gcloud secrets versions access` falla si el secreto no existe, y la
+  # plantilla ademas rechaza un valor vacio -- asi que sacar un MAVEN-* de
+  # Secret Manager sigue exigiendo bajar esta compuerta a mano.
   - name: publishToCentral
     value: 'true'
 
@@ -249,6 +250,11 @@ stages:
             PathtoPublish: '$(Build.ArtifactStagingDirectory)/package'
             ArtifactName: 'java-jars'
 
+        - template: .azure/templates/gcp-secrets.yml
+          parameters:
+            secretos:
+              GITHUB-SDK-MIRROR-TOKEN: cicd-github-sdk-mirror-token
+
         - script: |
             set -e
             git config user.email "ci@tesseractsoftwares.com"
@@ -409,25 +415,29 @@ stages:
             echo "Version $(pkgVersion) is not on Central yet (HTTP $CODE)."
           displayName: 'Check the version is unpublished'
 
-        # La llave de firma va como SECURE FILE y no como variable del grupo:
-        # son 4664 caracteres y una variable de ADO topa en 4096. Es la salida
-        # que la propia ADO indica para secretos que no caben.
-        - task: DownloadSecureFile@1
-          name: signingKey
-          displayName: 'Bajar la llave de firma'
-          inputs:
-            secureFile: 'maven-signing-key-b64.txt'
+        - template: .azure/templates/gcp-secrets.yml
+          parameters:
+            secretos:
+              MAVEN-SIGNING-PASSWORD: cicd-maven-signing-password
+              MAVEN-CENTRAL-TOKEN: cicd-maven-central-token
+              PRAXSPACE-INGEST-URL: cicd-praxspace-ingest-url
 
         - script: |
             set -e
             chmod +x ./gradlew
 
+            # La llave de firma se baja DIRECTO A UN ARCHIVO y no pasa por una
+            # variable del pipeline: son 4664 caracteres y ##vso[task.setvariable]
+            # no es el lugar para un blob de ese tamano. Secret Manager no tiene
+            # el tope de 4096 que si tienen las variables de ADO.
             KEY_FILE="$(Agent.TempDirectory)/signing-key.asc"
-            base64 -d < "$(signingKey.secureFilePath)" > "$KEY_FILE"
+            gcloud secrets versions access latest \
+              --secret=cicd-maven-signing-key-b64 \
+              --project="$(gcpProject)" | base64 -d > "$KEY_FILE"
             # A truncated or wrongly-encoded secret produces a file that is not a key at all, and
             # Gradle's failure for that case is opaque. Check the armour header instead.
             if ! head -1 "$KEY_FILE" | grep -q 'BEGIN PGP PRIVATE KEY BLOCK'; then
-              echo "##vso[task.logissue type=error]El secure file maven-signing-key-b64.txt no decodifica a una llave PGP armada. Vuelve a subirlo como base64 del export armado completo."
+              echo "##vso[task.logissue type=error]cicd-maven-signing-key-b64 no decodifica a una llave PGP armada. Vuelve a cargarlo como base64 del export armado completo."
               exit 1
             fi
 
