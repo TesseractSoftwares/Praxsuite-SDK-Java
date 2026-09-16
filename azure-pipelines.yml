@@ -25,17 +25,34 @@ pool:
   name: tesseract-buildpool
 
 variables:
-  isMaster: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
-  githubRepo: 'TesseractSoftwares/Praxsuite-SDK-Java'
+  # Los secretos de publicacion salian de prax-cicd-kv, que vive en la
+  # suscripcion de Azure bloqueada el 2026-09-15. Las lecturas todavia
+  # funcionan, pero si esa suscripcion llega a eliminarse el pipeline se cae.
+  # Este grupo es NATIVO de ADO: no se le agrega gcloud a un pipeline que no lo
+  # necesita para nada mas. Los nombres de variable son identicos a los del
+  # vault, asi que las referencias $(...) de mas abajo no cambian.
+  - group: sdk-publish
+  - name: isMaster
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
+  - name: githubRepo
+    value: 'TesseractSoftwares/Praxsuite-SDK-Java'
   # Pinned, not "latest". A latest link turns an unrelated upstream release into a broken build, and
   # Adoptium publishes a checksum for every asset so it is verified rather than trusted.
-  jdkVersion: '21.0.12.1_1'
-  jdkRelease: 'jdk-21.0.12.1%2B1'
+  - name: jdkVersion
+    value: '21.0.12.1_1'
+  - name: jdkRelease
+    value: 'jdk-21.0.12.1%2B1'
 
-  # The three MAVEN-* secrets exist in prax-cicd-kv as of 2026-08-24, so this is on. The gate stays
-  # because AzureKeyVault@2 fails the task when a name in SecretsFilter is missing - turning it off
-  # is how you keep every other build green if a secret ever has to be pulled.
-  publishToCentral: 'true'
+  # Los tres MAVEN-* ahora viven en el grupo sdk-publish, asi que esto sigue on.
+  #
+  # OJO, cambio de comportamiento respecto de Key Vault: AzureKeyVault@2 fallaba
+  # la tarea si un nombre del SecretsFilter no existia, y esta compuerta existia
+  # para poder apagar Central sin romper el resto. Un grupo de variables NO
+  # falla: una variable ausente llega vacia. Si algun dia se saca un MAVEN-* del
+  # grupo, hay que bajar esta compuerta a mano o la publicacion fallara mas
+  # adelante y de forma menos clara.
+  - name: publishToCentral
+    value: 'true'
 
   # USER_MANAGED, not AUTOMATIC, and this one is worth arguing for rather than defaulting.
   #
@@ -45,7 +62,8 @@ variables:
   # and a person clicks Publish in the portal after looking at it. That is one click per release
   # against a permanent mistake, which is a trade worth making - the TypeScript SDK shipped an empty
   # tarball to npm through a fully green pipeline, and npm at least let us replace it.
-  centralPublishingType: 'USER_MANAGED'
+  - name: centralPublishingType
+    value: 'USER_MANAGED'
 
 stages:
 
@@ -163,14 +181,6 @@ stages:
             mkdir -p jdk && tar -xzf jdk.tar.gz -C jdk --strip-components=1
             echo "##vso[task.setvariable variable=JAVA_HOME]$(Agent.TempDirectory)/jdk"
           displayName: 'Install JDK 21'
-
-        - task: AzureKeyVault@2
-          displayName: 'Read publish secrets'
-          inputs:
-            azureSubscription: 'sc-acr-push-core-prod'
-            KeyVaultName: 'prax-cicd-kv'
-            SecretsFilter: 'GITHUB-SDK-MIRROR-TOKEN'
-            RunAsPreJob: false
 
         # build.gradle.kts is the single source of truth for the version, so a release tag can never
         # disagree with what a consumer resolves.
@@ -377,14 +387,6 @@ stages:
         # is multi-line, and a multi-line value round-tripped through a pipeline variable is exactly
         # the kind of thing that arrives subtly reflowed - at which point the key does not import and
         # the error says nothing useful. Base64 is one line by construction.
-        - task: AzureKeyVault@2
-          displayName: 'Read Central secrets'
-          inputs:
-            azureSubscription: 'sc-acr-push-core-prod'
-            KeyVaultName: 'prax-cicd-kv'
-            SecretsFilter: 'MAVEN-SIGNING-KEY-B64,MAVEN-SIGNING-PASSWORD,MAVEN-CENTRAL-TOKEN,PRAXSPACE-INGEST-URL'
-            RunAsPreJob: false
-
         - script: |
             set -e
             VERSION=$(grep -m1 '^version = ' build.gradle.kts | cut -d'"' -f2)
