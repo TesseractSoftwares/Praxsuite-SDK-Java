@@ -409,16 +409,25 @@ stages:
             echo "Version $(pkgVersion) is not on Central yet (HTTP $CODE)."
           displayName: 'Check the version is unpublished'
 
+        # La llave de firma va como SECURE FILE y no como variable del grupo:
+        # son 4664 caracteres y una variable de ADO topa en 4096. Es la salida
+        # que la propia ADO indica para secretos que no caben.
+        - task: DownloadSecureFile@1
+          name: signingKey
+          displayName: 'Bajar la llave de firma'
+          inputs:
+            secureFile: 'maven-signing-key-b64.txt'
+
         - script: |
             set -e
             chmod +x ./gradlew
 
             KEY_FILE="$(Agent.TempDirectory)/signing-key.asc"
-            printf '%s' "$MAVEN_SIGNING_KEY_B64" | base64 -d > "$KEY_FILE"
+            base64 -d < "$(signingKey.secureFilePath)" > "$KEY_FILE"
             # A truncated or wrongly-encoded secret produces a file that is not a key at all, and
             # Gradle's failure for that case is opaque. Check the armour header instead.
             if ! head -1 "$KEY_FILE" | grep -q 'BEGIN PGP PRIVATE KEY BLOCK'; then
-              echo "##vso[task.logissue type=error]MAVEN-SIGNING-KEY-B64 did not decode to an armoured PGP private key. Re-store it as base64 of the full armoured export."
+              echo "##vso[task.logissue type=error]El secure file maven-signing-key-b64.txt no decodifica a una llave PGP armada. Vuelve a subirlo como base64 del export armado completo."
               exit 1
             fi
 
@@ -429,7 +438,6 @@ stages:
             rm -f "$KEY_FILE"
           displayName: 'Build the signed bundle'
           env:
-            MAVEN_SIGNING_KEY_B64: $(MAVEN-SIGNING-KEY-B64)
             MAVEN_SIGNING_PASSWORD: $(MAVEN-SIGNING-PASSWORD)
 
         # Central rejects an unsigned bundle, but it rejects it after the upload, in a deployment we
