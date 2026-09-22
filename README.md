@@ -27,6 +27,11 @@ for (Map<String, Object> row : page.rows()) {
 
 ---
 
+## Guides
+
+- [Use Case](https://learn.praxsuite.com/examples/java/java-sdk-use-case/)
+- [Implementation](https://learn.praxsuite.com/examples/java/java-sdk-implementation/)
+
 ## Install
 
 **Gradle**
